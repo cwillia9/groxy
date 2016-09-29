@@ -1,7 +1,14 @@
 package groxy
 
 import(
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"math/rand"
+	"sync"
+	"time"
+
 	"github.com/Shopify/sarama"
 	hash "github.com/aviddiviner/go-murmur"
 )
@@ -11,6 +18,12 @@ import(
 // self hostname
 // timeout
 // produce topic
+
+type idIncrementer struct {
+	seed 		int64
+	count    	int32
+	mu 			sync.Mutex
+}
 
 type Context struct {
 	consumeTopic string
@@ -25,8 +38,13 @@ type Context struct {
 	brokerConsumer sarama.Consumer 
 	partitionConsumer sarama.PartitionConsumer
 
-	httpChannels map[string]chan []byte
+	httpChannels map[int32]chan []byte
+	muhttpChannels *sync.Mutex
+
+	idInc *idIncrementer
 }
+
+const GROXY_MAGIC_STRING = "GrOxy"
 
 func NewContext(consumeTopic string,
 				consumeBrokers []string,
@@ -46,8 +64,8 @@ func NewContext(consumeTopic string,
 		return nil, err 
 	}
 	fmt.Println("here")
-	// Figure out what seed value to use
-	consumePartition := hash.MurmurHash2([]byte(hostname), 123) % uint32(len(consumePartitions))
+	
+	consumePartition := identifyPartition(uint32(len(consumePartitions)), []byte(hostname))
 
 	leadBroker, err := client.Leader(consumeTopic, int32(consumePartition))
 	fmt.Println("leadBroker", leadBroker.ID())
@@ -84,14 +102,120 @@ func NewContext(consumeTopic string,
 		producer: producer,
 		brokerConsumer: master,
 		partitionConsumer: consumer,
-		httpChannels: make(map[string]chan []byte),
+		httpChannels: make(map[int32]chan []byte),
+		muhttpChannels: new(sync.Mutex),
+		idInc: &idIncrementer{
+			seed: rand.Int63(),
+			count: 0,
+		},
 	}, nil
 }
 
-func (ctx *Context) Produce(key, value []byte) {
+func (ctx *Context) Produce(respchan chan []byte, key, value []byte) error {
+	identifier := ctx.idInc.Inc()
+
+	ctx.muhttpChannels.Lock()
+	if _, ok := ctx.httpChannels[identifier]; ok {
+		ctx.muhttpChannels.Unlock()
+		return errors.New("identifier already exists")
+	}
+	ctx.httpChannels[identifier] = respchan
+	ctx.muhttpChannels.Unlock()
+
+	go ctx.deleteKeyAfter(ctx.timeout, identifier)
+
+	//append magic byte and idetifier
+	header, err := binaryHeader(ctx.idInc.seed, identifier)
+	fmt.Println("header:", header)
+	if err != nil {
+		return err
+	}
+
+	appendedValue := append(header, value...)
+
 	ctx.producer.Input() <- &sarama.ProducerMessage{
 		Topic: 	ctx.produceTopic,
 		Key: 	sarama.ByteEncoder(key),
-		Value:	sarama.ByteEncoder(value),
+		Value:	sarama.ByteEncoder(appendedValue),
+	}
+
+	return nil
+}
+
+func identifyPartition(partitionsCount uint32, key []byte) uint32 {
+	// Figure out what seed value to use
+	return hash.MurmurHash2(key, 123) % partitionsCount
+}
+
+func (ctx *Context) deleteKeyAfter(ms int, key int32) {
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+	ctx.muhttpChannels.Lock()
+	defer ctx.muhttpChannels.Unlock()
+	if _, ok := ctx.httpChannels[key]; ok {
+		fmt.Println("about to delete key:", key)
+		delete(ctx.httpChannels, key)
 	}
 }
+
+func (ctx *Context) Keys() []int32 {
+	ctx.muhttpChannels.Lock()
+
+	keys := make([]int32, len(ctx.httpChannels))
+	defer ctx.muhttpChannels.Unlock()
+
+	for k := range ctx.httpChannels {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func binaryHeader(seed int64, count int32) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	err := binary.Write(buf, binary.BigEndian, seed)
+	if err != nil {
+		return nil, err
+	}
+	err = binary.Write(buf, binary.BigEndian, count)
+	if err != nil {
+		return nil, err
+	}
+
+	return append([]byte(GROXY_MAGIC_STRING), buf.Bytes()...), nil
+}
+
+func (i *idIncrementer) Inc() int32 {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.count += 1
+	return i.count 
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

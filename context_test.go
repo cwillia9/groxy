@@ -3,6 +3,7 @@ package groxy
 import(
 	"fmt"
 	"testing"
+	"time"
 	"github.com/Shopify/sarama"
 )
 
@@ -31,13 +32,21 @@ func TestBasicConsumerFunctionality(t *testing.T) {
 	})
 
 
-	ctx, err := NewContext("my_topic", []string{broker0.Addr()}, []string{leader.Addr()}, "wilco09", "produce_topic", 30)
+	ctx, err := NewContext("my_topic", []string{broker0.Addr()}, []string{leader.Addr()}, "wilco09", "produce_topic", 300)
 
 	fmt.Println(ctx)
 	fmt.Println(err)
 
+	receiveChan := make(chan []byte)
 
-	ctx.Produce([]byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	fmt.Println(ctx.Keys())
+	time.Sleep(320 * time.Millisecond)
+	fmt.Println(ctx.Keys())
 
 	broker0.Close()
 	leader.Close()
