@@ -1,17 +1,21 @@
 package groxy
 
-import(
+import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
+	//"fmt"
+	"log"
 	"math/rand"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 
 	"github.com/Shopify/sarama"
 	hash "github.com/aviddiviner/go-murmur"
 )
+
 // consume topic
 // consume brokers
 // poduce brokers
@@ -20,123 +24,192 @@ import(
 // produce topic
 
 type idIncrementer struct {
-	seed 		int64
-	count    	int32
-	mu 			sync.Mutex
+	seed  int64
+	count int32
+	mu    sync.Mutex
+}
+
+type KafkaContext struct {
+	Client sarama.Client
+
+	Consumer sarama.Consumer
+	Producer sarama.AsyncProducer
+
+	PartitionConsumer sarama.PartitionConsumer
+}
+
+type Message struct {
+	RespChan   chan []byte
+	Key, Value []byte
 }
 
 type Context struct {
+	Input  chan *Message
+	Delete chan int32
+
 	consumeTopic string
-	consumeBrokers []string
-	produceBrokers []string
 	selfHostname string
-	timeout int
+	timeout      int
 	produceTopic string
 
-	client   sarama.Client
-	producer sarama.AsyncProducer
-	brokerConsumer sarama.Consumer 
-	partitionConsumer sarama.PartitionConsumer
+	Kafka *KafkaContext
 
-	httpChannels map[int32]chan []byte
+	httpChannels   map[int32]chan []byte
 	muhttpChannels *sync.Mutex
 
 	idInc *idIncrementer
 }
 
+var Logger GroxyLogger = new(DefaultLogger)
+
+type GroxyLogger interface {
+	Debug(v ...interface{})
+	Info(v ...interface{})
+	Warn(v ...interface{})
+	Err(v ...interface{})
+	Crit(v ...interface{})
+}
+
+type DefaultLogger struct{}
+
+func (d *DefaultLogger) Debug(v ...interface{}) {
+	log.Println("[groxy] DEBUG:", v)
+}
+func (d *DefaultLogger) Info(v ...interface{}) {
+	log.Println("[groxy] INFO:", v)
+}
+func (d *DefaultLogger) Warn(v ...interface{}) {
+	log.Println("[groxy] WARN:", v)
+}
+func (d *DefaultLogger) Err(v ...interface{}) {
+	log.Println("[groxy] ERROR:", v)
+}
+func (d *DefaultLogger) Crit(v ...interface{}) {
+	log.Println("[groxy] CRITICAL:", v)
+}
+
+type StdLogger interface {
+	Print(v ...interface{})
+	Printf(format string, v ...interface{})
+	Println(v ...interface{})
+}
+
 const GROXY_MAGIC_STRING = "GrOxy"
 
-func NewContext(consumeTopic string,
-				consumeBrokers []string,
-				produceBrokers []string,
-				hostname string,
-				produceTopic string,
-				timeout int) (*Context, error) {
-	// Do we need to pass in config??
-	client, err := sarama.NewClient(consumeBrokers, nil)
-	if err != nil {
-		return nil, err
+func NewContext(kafkaContext *KafkaContext,
+	consumeTopic string,
+	hostname string,
+	produceTopic string,
+	timeout int) (*Context, error) {
+
+	var err error
+
+	Logger.Debug("Starting")
+
+	if kafkaContext.Consumer == nil {
+		kafkaContext.Consumer, err = sarama.NewConsumerFromClient(kafkaContext.Client)
+		if err != nil {
+			Logger.Err("Failed to create new consumer from client: ", err)
+			return nil, err
+		}
 	}
 
-	fmt.Println("here")
-	consumePartitions, err := client.Partitions(consumeTopic)
-	if err != nil {
-		return nil, err 
-	}
-	fmt.Println("here")
-	
-	consumePartition := identifyPartition(uint32(len(consumePartitions)), []byte(hostname))
+	if kafkaContext.Producer == nil {
 
-	leadBroker, err := client.Leader(consumeTopic, int32(consumePartition))
-	fmt.Println("leadBroker", leadBroker.ID())
-	if err != nil {
-		return nil, err 
-	}
-	fmt.Println("here")
-	// Again, do we need config here?
-	master, err := sarama.NewConsumer([]string{leadBroker.Addr()}, nil)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Println("here")
-
-	// Hardcoding OffsetNewest here
-	consumer, err := master.ConsumePartition(consumeTopic, int32(consumePartition), sarama.OffsetNewest)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Println("here")
-	producer, err := sarama.NewAsyncProducerFromClient(client)
-	if err != nil {
-		return nil, err
+		kafkaContext.Producer, err = sarama.NewAsyncProducerFromClient(kafkaContext.Client)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return &Context{
-		consumeTopic: consumeTopic,
-		consumeBrokers: consumeBrokers,
-		produceBrokers: produceBrokers,
-		selfHostname: hostname,
-		timeout: timeout,
-		produceTopic: produceTopic,
-		client: client,
-		producer: producer,
-		brokerConsumer: master,
-		partitionConsumer: consumer,
-		httpChannels: make(map[int32]chan []byte),
+	if kafkaContext.PartitionConsumer == nil {
+		consumePartitions, err := kafkaContext.Client.Partitions(consumeTopic)
+		if err != nil {
+			return nil, err
+		}
+
+		consumePartition := identifyPartition(uint32(len(consumePartitions)), []byte(hostname))
+
+		Logger.Info("consumePartition:", consumePartition, "sarama.OffsetLatest:", sarama.OffsetNewest)
+		kafkaContext.PartitionConsumer, err = kafkaContext.Consumer.ConsumePartition(consumeTopic, int32(consumePartition), sarama.OffsetNewest)
+
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	c := &Context{
+		Input:          make(chan *Message),
+		Delete:         make(chan int32),
+		consumeTopic:   consumeTopic,
+		selfHostname:   hostname,
+		timeout:        timeout,
+		produceTopic:   produceTopic,
+		Kafka:          kafkaContext,
+		httpChannels:   make(map[int32]chan []byte),
 		muhttpChannels: new(sync.Mutex),
 		idInc: &idIncrementer{
-			seed: rand.Int63(),
+			seed:  rand.Int63(),
 			count: 0,
 		},
-	}, nil
+	}
+
+	go c.run()
+	return c, nil
+}
+
+func (ctx *Context) run() {
+	// Trap SIGINT to trigger a shutdown.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
+
+	var in *Message
+	var err error
+	var del int32
+	var msg *sarama.ConsumerMessage
+
+	for {
+		select {
+		case in = <-ctx.Input:
+			err = ctx.Produce(in.RespChan, in.Key, in.Value)
+			Logger.Err(err)
+		case del = <-ctx.Delete:
+			if _, ok := ctx.httpChannels[del]; ok {
+				delete(ctx.httpChannels, del)
+			}
+		case msg = <-ctx.Kafka.PartitionConsumer.Messages():
+			ctx.ConsumeMessage(msg)
+		case <-signals:
+			break
+		}
+	}
+
 }
 
 func (ctx *Context) Produce(respchan chan []byte, key, value []byte) error {
 	identifier := ctx.idInc.Inc()
 
-	ctx.muhttpChannels.Lock()
 	if _, ok := ctx.httpChannels[identifier]; ok {
-		ctx.muhttpChannels.Unlock()
 		return errors.New("identifier already exists")
 	}
+
 	ctx.httpChannels[identifier] = respchan
-	ctx.muhttpChannels.Unlock()
 
 	go ctx.deleteKeyAfter(ctx.timeout, identifier)
 
 	//append magic byte and idetifier
 	header, err := binaryHeader(ctx.idInc.seed, identifier)
-	fmt.Println("header:", header)
+
 	if err != nil {
 		return err
 	}
 
 	appendedValue := append(header, value...)
 
-	ctx.producer.Input() <- &sarama.ProducerMessage{
-		Topic: 	ctx.produceTopic,
-		Key: 	sarama.ByteEncoder(key),
-		Value:	sarama.ByteEncoder(appendedValue),
+	ctx.Kafka.Producer.Input() <- &sarama.ProducerMessage{
+		Topic: ctx.produceTopic,
+		Key:   sarama.ByteEncoder(key),
+		Value: sarama.ByteEncoder(appendedValue),
 	}
 
 	return nil
@@ -149,24 +222,7 @@ func identifyPartition(partitionsCount uint32, key []byte) uint32 {
 
 func (ctx *Context) deleteKeyAfter(ms int, key int32) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
-	ctx.muhttpChannels.Lock()
-	defer ctx.muhttpChannels.Unlock()
-	if _, ok := ctx.httpChannels[key]; ok {
-		fmt.Println("about to delete key:", key)
-		delete(ctx.httpChannels, key)
-	}
-}
-
-func (ctx *Context) Keys() []int32 {
-	ctx.muhttpChannels.Lock()
-
-	keys := make([]int32, len(ctx.httpChannels))
-	defer ctx.muhttpChannels.Unlock()
-
-	for k := range ctx.httpChannels {
-		keys = append(keys, k)
-	}
-	return keys
+	ctx.Delete <- key
 }
 
 func binaryHeader(seed int64, count int32) ([]byte, error) {
@@ -184,38 +240,32 @@ func binaryHeader(seed int64, count int32) ([]byte, error) {
 }
 
 func (i *idIncrementer) Inc() int32 {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	i.count += 1
-	return i.count 
+	return i.count
 }
 
+func (ctx *Context) ConsumeMessage(msg *sarama.ConsumerMessage) {
+	value := msg.Value
 
+	if string(msg.Key) != ctx.selfHostname {
+		return
+	}
 
+	l := len(GROXY_MAGIC_STRING)
+	// Is this a GrOxy message?
+	if string(value[:l]) != GROXY_MAGIC_STRING {
+		return
+	}
 
+	// Is the message from this process instance?
+	if binary.BigEndian.Uint64(value[l:l+8]) != uint64(ctx.idInc.seed) {
+		return
+	}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+	key := int32(binary.BigEndian.Uint32(value[l+8 : l+12]))
+	if ch, ok := ctx.httpChannels[key]; ok {
+		go func() {
+			ch <- value[l+12:]
+		}()
+	}
+}
