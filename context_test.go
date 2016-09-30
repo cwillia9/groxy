@@ -12,7 +12,7 @@ import(
 
 
 
-func TestBasicConsumerFunctionality(t *testing.T) {
+func NotTestBasicConsumerFunctionality(t *testing.T) {
 	//sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
 
 	broker0 := sarama.NewMockBroker(t, 0)

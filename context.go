@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	//"fmt"
 	"log"
 	"math/rand"
 	"os"
@@ -15,13 +14,6 @@ import (
 	"github.com/Shopify/sarama"
 	hash "github.com/aviddiviner/go-murmur"
 )
-
-// consume topic
-// consume brokers
-// poduce brokers
-// self hostname
-// timeout
-// produce topic
 
 type idIncrementer struct {
 	seed  int64
@@ -183,7 +175,6 @@ func (ctx *Context) run() {
 			break
 		}
 	}
-
 }
 
 func (ctx *Context) Produce(respchan chan []byte, key, value []byte) error {
@@ -195,6 +186,7 @@ func (ctx *Context) Produce(respchan chan []byte, key, value []byte) error {
 
 	ctx.httpChannels[identifier] = respchan
 
+	// Get rid of this??
 	go ctx.deleteKeyAfter(ctx.timeout, identifier)
 
 	//append magic byte and idetifier
