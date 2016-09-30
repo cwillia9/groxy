@@ -50,7 +50,6 @@ func (gh *groxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	timeout := make(chan int)
 	go timeoutClock(gh.ctx.timeout, timeout)
-	defer close(timeout)
 
 	select {
 	case resp := <-respchan:
@@ -67,6 +66,9 @@ func (gh *groxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func timeoutClock(ms int, timeout chan int) {
+	defer func() {
+			_ = recover()
+	}()
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 	timeout <- 1
 }

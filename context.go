@@ -5,8 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/rand"
-	"os"
-	"os/signal"
 	"time"
 
 	"github.com/Shopify/sarama"
@@ -37,7 +35,9 @@ type Context struct {
 	Delete chan int32
 	Kafka  *KafkaContext
 
+	kill 		 chan int
 	consumeTopic string
+	consumePartition uint32
 	selfHostname string
 	timeout      int
 	produceTopic string
@@ -71,28 +71,30 @@ func NewContext(kafkaContext *KafkaContext,
 		if err != nil {
 			return nil, err
 		}
+		Logger.Info("produceTopic:", produceTopic)
 	}
 
+	var consumePartition uint32
 	if kafkaContext.PartitionConsumer == nil {
 		consumePartitions, err := kafkaContext.Client.Partitions(consumeTopic)
 		if err != nil {
 			return nil, err
 		}
 
-		consumePartition := identifyPartition(uint32(len(consumePartitions)), []byte(hostname))
-
-		Logger.Info("consumePartition:", consumePartition, "sarama.OffsetLatest:", sarama.OffsetNewest)
+		consumePartition = identifyPartition(uint32(len(consumePartitions)), []byte(hostname))
 		kafkaContext.PartitionConsumer, err = kafkaContext.Consumer.ConsumePartition(consumeTopic, int32(consumePartition), sarama.OffsetNewest)
-
 		if err != nil {
 			return nil, err
 		}
+		Logger.Info("cosumeTopic:", consumeTopic, "consumePartition:", consumePartition, "sarama.OffsetLatest:", sarama.OffsetNewest)
 	}
 
 	c := &Context{
 		Input:        make(chan *Message),
 		Delete:       make(chan int32),
+		kill:		  make(chan int),
 		consumeTopic: consumeTopic,
+		consumePartition: consumePartition,
 		selfHostname: hostname,
 		timeout:      timeout,
 		produceTopic: produceTopic,
@@ -109,10 +111,6 @@ func NewContext(kafkaContext *KafkaContext,
 }
 
 func (ctx *Context) run() {
-	// Trap SIGINT to trigger a shutdown.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
-
 	var in *Message
 	var err error
 	var del int32
@@ -133,18 +131,21 @@ func (ctx *Context) run() {
 			}
 		case msg = <-ctx.Kafka.PartitionConsumer.Messages():
 			ctx.ConsumeMessage(msg)
-		case <-signals:
+		case <-ctx.kill:
 			Logger.Info("Got kill signal. Shutting down system.")
-			ctx.Close()
-			break
 		}
 	}
 }
 
 func (ctx *Context) Close() {
-	ctx.Kafka.Producer.Close()
-	ctx.Kafka.Consumer.Close()
-	ctx.Kafka.Client.Close()
+	ctx.kill <- 1
+
+	if err := ctx.Kafka.Producer.Close(); err != nil {
+		Logger.Err(err)
+	}
+	if err := ctx.Kafka.Consumer.Close(); err != nil {
+		Logger.Err(err)
+	}
 }
 
 func (ctx *Context) producerSuccesses() {
@@ -178,7 +179,7 @@ func (ctx *Context) Produce(respchan chan []byte, key, value []byte) error {
 	go ctx.deleteKeyAfter(ctx.timeout, identifier)
 
 	//append magic byte and idetifier
-	header, err := binaryHeader(ctx.idInc.seed, identifier)
+	header, err := binaryHeader(ctx.idInc.seed, identifier, ctx.consumePartition)
 
 	if err != nil {
 		return err
@@ -196,6 +197,9 @@ func (ctx *Context) Produce(respchan chan []byte, key, value []byte) error {
 }
 
 func identifyPartition(partitionsCount uint32, key []byte) uint32 {
+	if partitionsCount < 1 {
+		return 0
+	}
 	// Figure out what seed value to use
 	return hash.MurmurHash2(key, 123) % partitionsCount
 }
@@ -205,13 +209,18 @@ func (ctx *Context) deleteKeyAfter(ms int, key int32) {
 	ctx.Delete <- key
 }
 
-func binaryHeader(seed int64, count int32) ([]byte, error) {
+func binaryHeader(seed int64, count int32, partition uint32) ([]byte, error) {
 	buf := new(bytes.Buffer)
 	err := binary.Write(buf, binary.BigEndian, seed)
 	if err != nil {
 		return nil, err
 	}
 	err = binary.Write(buf, binary.BigEndian, count)
+	if err != nil {
+		return nil, err
+	}
+
+	err = binary.Write(buf, binary.BigEndian, partition)
 	if err != nil {
 		return nil, err
 	}
@@ -225,11 +234,9 @@ func (i *idIncrementer) Inc() int32 {
 }
 
 func (ctx *Context) ConsumeMessage(msg *sarama.ConsumerMessage) {
+	// First part of message :
+	// [GROXY_MAGIC_STRING| 8 byte random num | 4 byte incrementing value | 4 byte partition id]
 	value := msg.Value
-
-	if string(msg.Key) != ctx.selfHostname {
-		return
-	}
 
 	l := len(GROXY_MAGIC_STRING)
 	// Is this a GrOxy message?
@@ -245,7 +252,11 @@ func (ctx *Context) ConsumeMessage(msg *sarama.ConsumerMessage) {
 	key := int32(binary.BigEndian.Uint32(value[l+8 : l+12]))
 	if ch, ok := ctx.httpChannels[key]; ok {
 		go func() {
-			ch <- value[l+12:]
+			defer func() {
+				_ = recover()
+			}()
+			Logger.Debug("Sending byte array:", value[l+8+4+4:])
+			ch <- value[l+8+4+4:]
 		}()
 	}
 }
