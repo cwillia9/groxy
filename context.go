@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"log"
 	"math/rand"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
 
 	"github.com/Shopify/sarama"
@@ -18,7 +16,6 @@ import (
 type idIncrementer struct {
 	seed  int64
 	count int32
-	mu    sync.Mutex
 }
 
 type KafkaContext struct {
@@ -38,52 +35,14 @@ type Message struct {
 type Context struct {
 	Input  chan *Message
 	Delete chan int32
+	Kafka  *KafkaContext
 
 	consumeTopic string
 	selfHostname string
 	timeout      int
 	produceTopic string
-
-	Kafka *KafkaContext
-
-	httpChannels   map[int32]chan []byte
-	muhttpChannels *sync.Mutex
-
-	idInc *idIncrementer
-}
-
-var Logger GroxyLogger = new(DefaultLogger)
-
-type GroxyLogger interface {
-	Debug(v ...interface{})
-	Info(v ...interface{})
-	Warn(v ...interface{})
-	Err(v ...interface{})
-	Crit(v ...interface{})
-}
-
-type DefaultLogger struct{}
-
-func (d *DefaultLogger) Debug(v ...interface{}) {
-	log.Println("[groxy] DEBUG:", v)
-}
-func (d *DefaultLogger) Info(v ...interface{}) {
-	log.Println("[groxy] INFO:", v)
-}
-func (d *DefaultLogger) Warn(v ...interface{}) {
-	log.Println("[groxy] WARN:", v)
-}
-func (d *DefaultLogger) Err(v ...interface{}) {
-	log.Println("[groxy] ERROR:", v)
-}
-func (d *DefaultLogger) Crit(v ...interface{}) {
-	log.Println("[groxy] CRITICAL:", v)
-}
-
-type StdLogger interface {
-	Print(v ...interface{})
-	Printf(format string, v ...interface{})
-	Println(v ...interface{})
+	httpChannels map[int32]chan []byte
+	idInc        *idIncrementer
 }
 
 const GROXY_MAGIC_STRING = "GrOxy"
@@ -131,15 +90,14 @@ func NewContext(kafkaContext *KafkaContext,
 	}
 
 	c := &Context{
-		Input:          make(chan *Message),
-		Delete:         make(chan int32),
-		consumeTopic:   consumeTopic,
-		selfHostname:   hostname,
-		timeout:        timeout,
-		produceTopic:   produceTopic,
-		Kafka:          kafkaContext,
-		httpChannels:   make(map[int32]chan []byte),
-		muhttpChannels: new(sync.Mutex),
+		Input:        make(chan *Message),
+		Delete:       make(chan int32),
+		consumeTopic: consumeTopic,
+		selfHostname: hostname,
+		timeout:      timeout,
+		produceTopic: produceTopic,
+		Kafka:        kafkaContext,
+		httpChannels: make(map[int32]chan []byte),
 		idInc: &idIncrementer{
 			seed:  rand.Int63(),
 			count: 0,
@@ -160,6 +118,10 @@ func (ctx *Context) run() {
 	var del int32
 	var msg *sarama.ConsumerMessage
 
+	go ctx.producerSuccesses()
+	go ctx.producerErrors()
+	go ctx.consumerErrors()
+
 	for {
 		select {
 		case in = <-ctx.Input:
@@ -172,8 +134,34 @@ func (ctx *Context) run() {
 		case msg = <-ctx.Kafka.PartitionConsumer.Messages():
 			ctx.ConsumeMessage(msg)
 		case <-signals:
+			Logger.Info("Got kill signal. Shutting down system.")
+			ctx.Close()
 			break
 		}
+	}
+}
+
+func (ctx *Context) Close() {
+	ctx.Kafka.Producer.Close()
+	ctx.Kafka.Consumer.Close()
+	ctx.Kafka.Client.Close()
+}
+
+func (ctx *Context) producerSuccesses() {
+	for _ = range ctx.Kafka.Producer.Successes() {
+		Logger.Debug("Message successfully sent")
+	}
+}
+
+func (ctx *Context) producerErrors() {
+	for e := range ctx.Kafka.Producer.Errors() {
+		Logger.Err("Producer error:", e)
+	}
+}
+
+func (ctx *Context) consumerErrors() {
+	for e := range ctx.Kafka.PartitionConsumer.Errors() {
+		Logger.Err("Consumer error:", e)
 	}
 }
 

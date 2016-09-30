@@ -5,21 +5,20 @@ import (
 	"time"
 )
 
-
-type SerDe interface{
+type SerDe interface {
 	Serialize(*http.Request) ([]byte, error)
 	Deserialize([]byte, http.ResponseWriter) error
 	Key(*http.Request) ([]byte, error)
 }
 
-type groxyHandler struct{
-	ctx *Context
+type groxyHandler struct {
+	ctx   *Context
 	serde SerDe
 }
 
 func NewHandler(ctx *Context, serde SerDe) http.Handler {
 	return &groxyHandler{
-		ctx: ctx,
+		ctx:   ctx,
 		serde: serde,
 	}
 }
@@ -53,21 +52,21 @@ func (gh *groxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go timeoutClock(gh.ctx.timeout, timeout)
 	defer close(timeout)
 
-	select{
-		case resp := <- respchan:
-			err := gh.serde.Deserialize(resp, w)
-			if err != nil {
-				Logger.Err("Deserialize failed:", err)
-			}
-			return
-		case <-timeout:
-			http.Error(w, "Timeout", http.StatusGatewayTimeout)
-			Logger.Err("Timedout before responding")
-			return
+	select {
+	case resp := <-respchan:
+		err := gh.serde.Deserialize(resp, w)
+		if err != nil {
+			Logger.Err("Deserialize failed:", err)
+		}
+		return
+	case <-timeout:
+		http.Error(w, "Timeout", http.StatusGatewayTimeout)
+		Logger.Err("Timedout before responding")
+		return
 	}
 }
 
 func timeoutClock(ms int, timeout chan int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
-	timeout <- 1 
+	timeout <- 1
 }
