@@ -26,8 +26,9 @@ type KafkaContext struct {
 }
 
 type Message struct {
-	RespChan   chan []byte
+	RespChan   chan<- []byte
 	Key, Value []byte
+	Err        error
 }
 
 type Context struct {
@@ -35,14 +36,13 @@ type Context struct {
 	Delete chan int32
 	Kafka  *KafkaContext
 
-	kill 		 chan int
-	consumeTopic string
+	kill             chan int
+	consumeTopic     string
 	consumePartition uint32
-	selfHostname string
-	timeout      int
-	produceTopic string
-	httpChannels map[int32]chan []byte
-	idInc        *idIncrementer
+	selfHostname     string
+	timeout          int
+	produceTopic     string
+	idInc            *idIncrementer
 }
 
 const GROXY_MAGIC_STRING = "GrOxy"
@@ -54,9 +54,6 @@ func NewContext(kafkaContext *KafkaContext,
 	timeout int) (*Context, error) {
 
 	var err error
-
-	Logger.Debug("Starting")
-
 	if kafkaContext.Consumer == nil {
 		kafkaContext.Consumer, err = sarama.NewConsumerFromClient(kafkaContext.Client)
 		if err != nil {
@@ -66,7 +63,6 @@ func NewContext(kafkaContext *KafkaContext,
 	}
 
 	if kafkaContext.Producer == nil {
-
 		kafkaContext.Producer, err = sarama.NewAsyncProducerFromClient(kafkaContext.Client)
 		if err != nil {
 			return nil, err
@@ -90,16 +86,15 @@ func NewContext(kafkaContext *KafkaContext,
 	}
 
 	c := &Context{
-		Input:        make(chan *Message),
-		Delete:       make(chan int32),
-		kill:		  make(chan int),
-		consumeTopic: consumeTopic,
+		Input:            make(chan *Message),
+		Delete:           make(chan int32),
+		kill:             make(chan int),
+		consumeTopic:     consumeTopic,
 		consumePartition: consumePartition,
-		selfHostname: hostname,
-		timeout:      timeout,
-		produceTopic: produceTopic,
-		Kafka:        kafkaContext,
-		httpChannels: make(map[int32]chan []byte),
+		selfHostname:     hostname,
+		timeout:          timeout,
+		produceTopic:     produceTopic,
+		Kafka:            kafkaContext,
 		idInc: &idIncrementer{
 			seed:  rand.Int63(),
 			count: 0,
@@ -111,6 +106,8 @@ func NewContext(kafkaContext *KafkaContext,
 }
 
 func (ctx *Context) run() {
+	httpChannels := make(map[int32]chan<- []byte)
+
 	var in *Message
 	var err error
 	var del int32
@@ -123,29 +120,32 @@ func (ctx *Context) run() {
 	for {
 		select {
 		case in = <-ctx.Input:
-			err = ctx.Produce(in.RespChan, in.Key, in.Value)
-			Logger.Err(err)
+			err = ctx.produce(in.RespChan, in.Key, in.Value, httpChannels)
+			if err != nil {
+				Logger.Err(err)
+				in.RespChan <- nil
+			}
 		case del = <-ctx.Delete:
-			if _, ok := ctx.httpChannels[del]; ok {
-				delete(ctx.httpChannels, del)
+			if _, ok := httpChannels[del]; ok {
+				delete(httpChannels, del)
 			}
 		case msg = <-ctx.Kafka.PartitionConsumer.Messages():
-			ctx.ConsumeMessage(msg)
+			ctx.consumeMessage(msg, httpChannels)
 		case <-ctx.kill:
 			Logger.Info("Got kill signal. Shutting down system.")
+			break
 		}
 	}
 }
 
 func (ctx *Context) Close() {
-	ctx.kill <- 1
-
 	if err := ctx.Kafka.Producer.Close(); err != nil {
 		Logger.Err(err)
 	}
 	if err := ctx.Kafka.Consumer.Close(); err != nil {
 		Logger.Err(err)
 	}
+	ctx.kill <- 1
 }
 
 func (ctx *Context) producerSuccesses() {
@@ -166,21 +166,22 @@ func (ctx *Context) consumerErrors() {
 	}
 }
 
-func (ctx *Context) Produce(respchan chan []byte, key, value []byte) error {
+func (ctx *Context) produce(respchan chan<- []byte,
+	key, value []byte,
+	httpChannels map[int32]chan<- []byte) error {
 	identifier := ctx.idInc.Inc()
 
-	if _, ok := ctx.httpChannels[identifier]; ok {
+	if _, ok := httpChannels[identifier]; ok {
 		return errors.New("identifier already exists")
 	}
 
-	ctx.httpChannels[identifier] = respchan
+	httpChannels[identifier] = respchan
 
 	// Get rid of this??
 	go ctx.deleteKeyAfter(ctx.timeout, identifier)
 
 	//append magic byte and idetifier
 	header, err := binaryHeader(ctx.idInc.seed, identifier, ctx.consumePartition)
-
 	if err != nil {
 		return err
 	}
@@ -233,7 +234,8 @@ func (i *idIncrementer) Inc() int32 {
 	return i.count
 }
 
-func (ctx *Context) ConsumeMessage(msg *sarama.ConsumerMessage) {
+func (ctx *Context) consumeMessage(msg *sarama.ConsumerMessage,
+	httpChannels map[int32]chan<- []byte) {
 	// First part of message :
 	// [GROXY_MAGIC_STRING| 8 byte random num | 4 byte incrementing value | 4 byte partition id]
 	value := msg.Value
@@ -250,12 +252,9 @@ func (ctx *Context) ConsumeMessage(msg *sarama.ConsumerMessage) {
 	}
 
 	key := int32(binary.BigEndian.Uint32(value[l+8 : l+12]))
-	if ch, ok := ctx.httpChannels[key]; ok {
+	if ch, ok := httpChannels[key]; ok {
 		go func() {
-			defer func() {
-				_ = recover()
-			}()
-			Logger.Debug("Sending byte array:", value[l+8+4+4:])
+			defer func() { _ = recover() }()
 			ch <- value[l+8+4+4:]
 		}()
 	}

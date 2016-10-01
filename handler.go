@@ -31,8 +31,7 @@ func (gh *groxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respchan := make(chan []byte)
-	defer close(respchan)
+	respchan := make(chan []byte, 1)
 
 	key, err := gh.serde.Key(r)
 	if err != nil {
@@ -41,18 +40,22 @@ func (gh *groxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = gh.ctx.Produce(respchan, key, serialized)
-	if err != nil {
-		http.Error(w, "Internal Error", http.StatusInternalServerError)
-		Logger.Err("Failed to produce message:", err)
-		return
+	gh.ctx.Input <- &Message{
+		RespChan: respchan,
+		Key:      key,
+		Value:    serialized,
 	}
 
-	timeout := make(chan int)
+	timeout := make(chan int, 1)
 	go timeoutClock(gh.ctx.timeout, timeout)
 
 	select {
 	case resp := <-respchan:
+		if resp == nil {
+			http.Error(w, "Internal Error", http.StatusInternalServerError)
+			return
+		}
+
 		err := gh.serde.Deserialize(resp, w)
 		if err != nil {
 			Logger.Err("Deserialize failed:", err)
@@ -67,7 +70,7 @@ func (gh *groxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func timeoutClock(ms int, timeout chan int) {
 	defer func() {
-			_ = recover()
+		_ = recover()
 	}()
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 	timeout <- 1
