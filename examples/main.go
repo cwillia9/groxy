@@ -1,7 +1,6 @@
-package main 
+package main
 
-
-import(
+import (
 	"fmt"
 	"log"
 	"net/http"
@@ -9,7 +8,6 @@ import(
 	"github.com/Shopify/sarama"
 	"github.com/cwillia9/groxy"
 )
-
 
 type MySerde struct {
 	key []byte
@@ -41,7 +39,7 @@ func (s *MySerde) Key(r *http.Request) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return s.key, nil 
+	return s.key, nil
 }
 
 func main() {
@@ -72,8 +70,8 @@ func main() {
 		fmt.Println(err)
 	}
 
-	http.Handle("/coltonstuff", groxy.NewHandler(ctx, &MySerde{}))
-	http.Handle("/samstuff", groxy.NewHandler(ctx, &MySerde{}))
+	http.Handle("/coltonstuff", groxy.NewFifoHandler(ctx, &MySerde{}))
+	http.Handle("/samstuff", groxy.NewFifoHandler(ctx, &MySerde{}))
 	err = http.ListenAndServe(":9999", nil)
 	if err != nil {
 		log.Fatal("ListenAndServe:", err)
@@ -85,9 +83,8 @@ func consumeAndProduce(pc sarama.PartitionConsumer, p sarama.AsyncProducer) {
 	for m := range pc.Messages() {
 		p.Input() <- &sarama.ProducerMessage{
 			Topic: "resp_topic",
-			Key: sarama.StringEncoder("blah"),
+			Key:   sarama.StringEncoder("blah"),
 			Value: sarama.ByteEncoder(m.Value),
 		}
 	}
 }
-

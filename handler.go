@@ -11,15 +11,77 @@ type SerDe interface {
 	Key(*http.Request) ([]byte, error)
 }
 
-type groxyHandler struct {
-	ctx   *Context
-	serde SerDe
+type Decider interface {
+	// Decide should be a blocking function which decides
+	// which of potentially several responses to actually
+	// respond back to the client with. The decision will be inferred
+	// by the return value of the byte slice and error.
+	Decide(respchan <-chan []byte, timeout <-chan int) ([]byte, error)
 }
 
-func NewHandler(ctx *Context, serde SerDe) http.Handler {
+type FifoDecider struct{}
+
+func (f *FifoDecider) Decide(respchan <-chan []byte, timeout <-chan int) ([]byte, error) {
+	select {
+	case resp := <-respchan:
+		return resp, nil
+	case <-timeout:
+		return nil, ErrTimeout
+	}
+}
+
+type LifoDecider struct {
+	resp         []byte
+	receivedResp bool
+}
+
+func (d *LifoDecider) Decide(respchan <-chan []byte, timeout <-chan int) ([]byte, error) {
+	for {
+		select {
+		case r := <-respchan:
+			d.resp = r
+			d.receivedResp = true
+		case <-timeout:
+			if d.resp != nil {
+				return d.resp, nil
+			}
+			if d.resp == nil && d.receivedResp {
+				return nil, nil
+			}
+			if !d.receivedResp {
+				return nil, ErrTimeout
+			}
+		}
+	}
+}
+
+type groxyHandler struct {
+	ctx     *Context
+	serde   SerDe
+	decider Decider
+}
+
+func NewFifoHandler(ctx *Context, serde SerDe) http.Handler {
 	return &groxyHandler{
-		ctx:   ctx,
-		serde: serde,
+		ctx:     ctx,
+		serde:   serde,
+		decider: &FifoDecider{},
+	}
+}
+
+func NewLifoHandler(ctx *Context, serde SerDe) http.Handler {
+	return &groxyHandler{
+		ctx:     ctx,
+		serde:   serde,
+		decider: &LifoDecider{},
+	}
+}
+
+func NewCustomHandler(ctx *Context, serde SerDe, d Decider) http.Handler {
+	return &groxyHandler{
+		ctx:     ctx,
+		serde:   serde,
+		decider: d,
 	}
 }
 
@@ -49,22 +111,25 @@ func (gh *groxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	timeout := make(chan int, 1)
 	go timeoutClock(gh.ctx.timeout, timeout)
 
-	select {
-	case resp := <-respchan:
-		if resp == nil {
-			http.Error(w, "Internal Error", http.StatusInternalServerError)
+	resp, err := gh.decider.Decide(respchan, timeout)
+	if err != nil {
+		if err == ErrTimeout {
+			http.Error(w, "Timeout", http.StatusGatewayTimeout)
+			Logger.Err("Timedout before responding")
 			return
 		}
+		http.Error(w, "error", http.StatusInternalServerError)
+		Logger.Err(err)
+		return
+	}
 
-		err := gh.serde.Deserialize(resp, w)
-		if err != nil {
-			Logger.Err("Deserialize failed:", err)
-		}
+	err = gh.serde.Deserialize(resp, w)
+	if err != nil {
+		Logger.Err("Deserialize failed:", err)
 		return
-	case <-timeout:
-		http.Error(w, "Timeout", http.StatusGatewayTimeout)
-		Logger.Err("Timedout before responding")
-		return
+	}
+	if resp == nil {
+
 	}
 }
 
