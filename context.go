@@ -295,8 +295,15 @@ func (ctx *Context) consumeMessage(msg *sarama.ConsumerMessage,
 	header := &BinaryHeader{}
 	err := header.Read(value)
 	if err != nil {
-		//TODO: Handle different error conditions
-		return
+		switch err {
+		case ErrNotGroxyMessage:
+			//TODO:Not considering this a problem. Should we?
+			Logger.Debug(err)
+			return
+		case ErrFailedToReadHeader:
+			Logger.Err(err)
+			return
+		}
 	}
 
 	if header.Seed != ctx.idInc.seed {
