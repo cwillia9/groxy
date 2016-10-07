@@ -16,6 +16,16 @@ type idIncrementer struct {
 	count int32
 }
 
+type BinaryHeader struct {
+	Seed      int64
+	Count     int32
+	Partition uint32
+	Topic     string
+
+	Header []byte
+	Len    int
+}
+
 type KafkaContext struct {
 	Client sarama.Client
 
@@ -181,12 +191,18 @@ func (ctx *Context) produce(respchan chan<- []byte,
 	go ctx.deleteKeyAfter(ctx.timeout, identifier)
 
 	//append magic byte and idetifier
-	header, err := binaryHeader(ctx.idInc.seed, identifier, ctx.consumePartition)
-	if err != nil {
-		return err
+	header := &BinaryHeader{
+		Seed:      ctx.idInc.seed,
+		Count:     identifier,
+		Partition: ctx.consumePartition,
+		Topic:     ctx.consumeTopic,
+	}
+	header.Write()
+	if header.Header == nil {
+		return ErrFailedToMakeHeader
 	}
 
-	appendedValue := append(header, value...)
+	appendedValue := append(header.Header, value...)
 
 	ctx.Kafka.Producer.Input() <- &sarama.ProducerMessage{
 		Topic: ctx.produceTopic,
@@ -210,23 +226,60 @@ func (ctx *Context) deleteKeyAfter(ms int, key int32) {
 	ctx.Delete <- key
 }
 
-func binaryHeader(seed int64, count int32, partition uint32) ([]byte, error) {
+func (b *BinaryHeader) Write() {
 	buf := new(bytes.Buffer)
-	err := binary.Write(buf, binary.BigEndian, seed)
+	err := binary.Write(buf, binary.BigEndian, b.Seed)
 	if err != nil {
-		return nil, err
+		b.Header = nil
 	}
-	err = binary.Write(buf, binary.BigEndian, count)
+	err = binary.Write(buf, binary.BigEndian, b.Count)
 	if err != nil {
-		return nil, err
-	}
-
-	err = binary.Write(buf, binary.BigEndian, partition)
-	if err != nil {
-		return nil, err
+		b.Header = nil
 	}
 
-	return append([]byte(GROXY_MAGIC_STRING), buf.Bytes()...), nil
+	err = binary.Write(buf, binary.BigEndian, b.Partition)
+	if err != nil {
+		b.Header = nil
+	}
+
+	bytes_topic := []byte(b.Topic)
+	err = binary.Write(buf, binary.BigEndian, uint32(len(bytes_topic)))
+	if err != nil {
+		b.Header = nil
+	}
+
+	_, _ = buf.Write(bytes_topic)
+
+	b.Header = append([]byte(GROXY_MAGIC_STRING), buf.Bytes()...)
+}
+
+func (b *BinaryHeader) Read(value []byte) error {
+	if value == nil {
+		return ErrFailedToReadHeader
+	}
+
+	l := len(GROXY_MAGIC_STRING)
+	if len(value) <= l+20 {
+		return ErrFailedToReadHeader
+	}
+
+	// Is this a GrOxy message?
+	if string(value[:l]) != GROXY_MAGIC_STRING {
+		return ErrNotGroxyMessage
+	}
+
+	// Is the message from this process instance?
+	b.Seed = int64(binary.BigEndian.Uint64(value[l : l+8]))
+	b.Count = int32(binary.BigEndian.Uint32(value[l+8 : l+12]))
+	b.Partition = binary.BigEndian.Uint32(value[l+12 : l+16])
+
+	strlen := int(binary.BigEndian.Uint32(value[l+16 : l+20]))
+	if len(value) < l+20+strlen {
+		return ErrFailedToReadHeader
+	}
+	b.Topic = string(value[l+20 : l+20+strlen])
+	b.Len = l + 20 + strlen
+	return nil
 }
 
 func (i *idIncrementer) Inc() int32 {
@@ -236,26 +289,24 @@ func (i *idIncrementer) Inc() int32 {
 
 func (ctx *Context) consumeMessage(msg *sarama.ConsumerMessage,
 	httpChannels map[int32]chan<- []byte) {
-	// First part of message :
-	// [GROXY_MAGIC_STRING| 8 byte random num | 4 byte incrementing value | 4 byte partition id]
+
 	value := msg.Value
 
-	l := len(GROXY_MAGIC_STRING)
-	// Is this a GrOxy message?
-	if string(value[:l]) != GROXY_MAGIC_STRING {
+	header := &BinaryHeader{}
+	err := header.Read(value)
+	if err != nil {
+		//TODO: Handle different error conditions
 		return
 	}
 
-	// Is the message from this process instance?
-	if binary.BigEndian.Uint64(value[l:l+8]) != uint64(ctx.idInc.seed) {
+	if header.Seed != ctx.idInc.seed {
 		return
 	}
 
-	key := int32(binary.BigEndian.Uint32(value[l+8 : l+12]))
-	if ch, ok := httpChannels[key]; ok {
+	if ch, ok := httpChannels[header.Count]; ok {
 		go func() {
 			defer func() { _ = recover() }()
-			ch <- value[l+8+4+4:]
+			ch <- value[header.Len:]
 		}()
 	}
 }
