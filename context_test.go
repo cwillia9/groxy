@@ -2,14 +2,19 @@ package groxy
 
 import(
 	"fmt"
+	//"log"
+	//"os"
 	"testing"
 	"time"
 	"github.com/Shopify/sarama"
+	"github.com/Shopify/sarama/mocks"
 )
 
 
 
-func TestBasicConsumerFunctionality(t *testing.T) {
+func NotTestBasicConsumerFunctionality(t *testing.T) {
+	//sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
+
 	broker0 := sarama.NewMockBroker(t, 0)
 	leader := sarama.NewMockBroker(t, 1)
 
@@ -31,23 +36,61 @@ func TestBasicConsumerFunctionality(t *testing.T) {
 		"FetchRequest": mockFetchResponse,
 	})
 
+	client, err := sarama.NewClient([]string{broker0.Addr(), leader.Addr()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &KafkaContext{Client: client}
 
-	ctx, err := NewContext("my_topic", []string{broker0.Addr()}, []string{leader.Addr()}, "wilco09", "produce_topic", 300)
+	cfg := sarama.NewConfig()
 
-	fmt.Println(ctx)
-	fmt.Println(err)
+	cfg.Producer.Return.Successes = true
+	producer := mocks.NewAsyncProducer(t, cfg)
+	producer.ExpectInputAndSucceed()
+	producer.ExpectInputAndSucceed()
+	producer.ExpectInputAndSucceed()
+	producer.ExpectInputAndSucceed()
+	producer.ExpectInputAndSucceed()
+
+	k.Producer = producer
+
+	consumer := mocks.NewConsumer(t, nil)
+	partitionconsumer := consumer.ExpectConsumePartition("my_topic", 0, sarama.OffsetNewest)
+	fmt.Println(consumer)
+	k.Consumer = consumer
+	k.PartitionConsumer = partitionconsumer
+
+	ctx, err := NewContext(k, "my_topic", "wilco09", "produce_topic", 300)
 
 	receiveChan := make(chan []byte)
 
-	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
-	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
-	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
-	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
-	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
-	fmt.Println(ctx.Keys())
-	time.Sleep(320 * time.Millisecond)
-	fmt.Println(ctx.Keys())
+	go func(){
+		for v := range receiveChan {
+			Logger.Info("received message:", string(v))
+		}
+	}()
 
+	go func() {
+		for v := range ctx.Kafka.Producer.Successes() {
+			Logger.Info(fmt.Sprint(v))
+			val, _ := v.Value.Encode()
+			partitionconsumer.YieldMessage(&sarama.ConsumerMessage{
+				Key: []byte("wilco09"),
+				Value: val,
+				})
+		}
+	}()
+
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+	ctx.Produce(receiveChan, []byte("ok"), []byte("hello"))
+
+
+	time.Sleep(100 * time.Millisecond)
+	client.Close()
+	producer.Close()
 	broker0.Close()
 	leader.Close()
 }
@@ -66,10 +109,15 @@ func NotTestLessBasicFunctionality(t *testing.T) {
 	prodSuccess.AddTopicPartition("my_topic", 0, sarama.ErrNoError)
 	leader.Returns(prodSuccess)
 
-	ctx, err := NewContext("my_topic", []string{seedBroker.Addr()}, []string{seedBroker.Addr()}, "wilco09", "produce_topic", 30)
+	client, err := sarama.NewClient([]string{seedBroker.Addr(), leader.Addr()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &KafkaContext{Client: client}
+	_, _ = NewContext(k, "my_topic", "wilco09", "produce_topic", 30)
 
-	fmt.Println(ctx)
-	fmt.Println(err)
+	
+	
 
 	seedBroker.Close()
 	leader.Close()
